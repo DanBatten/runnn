@@ -1,0 +1,110 @@
+{
+  "name": "injury_escalation",
+  "summary": "Escalates response when injury severity increases or persists. Blocks running when severity >= 7 or injury is worsening.",
+  "rules": {
+    "type": "injury_escalation",
+    "priority": 100,
+    "conditions": [
+      {
+        "field": "",
+        "operator": "or",
+        "value": [
+          {
+            "field": "active_injury_severity",
+            "operator": "gte",
+            "value": 7
+          },
+          {
+            "field": "",
+            "operator": "and",
+            "value": [
+              {
+                "field": "active_injury_severity",
+                "operator": "gte",
+                "value": 4
+              },
+              {
+                "field": "injury_trend",
+                "operator": "eq",
+                "value": "worsening"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "type": "block",
+        "params": {
+          "reason": "Injury severity requires rest",
+          "duration_days": 2
+        }
+      },
+      {
+        "type": "flag_for_review",
+        "params": {
+          "reason": "Consider seeking professional evaluation",
+          "severity": "high"
+        }
+      }
+    ]
+  },
+  "tests": [
+    {
+      "name": "Should block when severity >= 7",
+      "fixture": {
+        "active_injury_severity": 7,
+        "injury_trend": "stable",
+        "active_injury_location": "left_calf"
+      },
+      "expected_triggered": true,
+      "expected_actions": ["block", "flag_for_review"]
+    },
+    {
+      "name": "Should block when severity 4+ and worsening",
+      "fixture": {
+        "active_injury_severity": 5,
+        "injury_trend": "worsening",
+        "active_injury_location": "right_knee"
+      },
+      "expected_triggered": true,
+      "expected_actions": ["block", "flag_for_review"]
+    },
+    {
+      "name": "Should not block when severity 4 but improving",
+      "fixture": {
+        "active_injury_severity": 4,
+        "injury_trend": "improving",
+        "active_injury_location": "left_shin"
+      },
+      "expected_triggered": false
+    },
+    {
+      "name": "Should not block when severity low",
+      "fixture": {
+        "active_injury_severity": 3,
+        "injury_trend": "worsening",
+        "active_injury_location": "right_achilles"
+      },
+      "expected_triggered": false
+    },
+    {
+      "name": "Should block at severity 10",
+      "fixture": {
+        "active_injury_severity": 10,
+        "injury_trend": "stable"
+      },
+      "expected_triggered": true,
+      "expected_actions": ["block", "flag_for_review"]
+    },
+    {
+      "name": "Should not trigger when no injury",
+      "fixture": {
+        "active_injury_severity": null,
+        "injury_trend": null
+      },
+      "expected_triggered": false
+    }
+  ]
+}

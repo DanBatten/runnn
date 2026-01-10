@@ -1,0 +1,70 @@
+{
+  "name": "weekly_ramp_rate",
+  "summary": "Limits weekly mileage increase to prevent overtraining. Default max ramp is 10%.",
+  "rules": {
+    "type": "weekly_ramp",
+    "priority": 100,
+    "conditions": [
+      {
+        "field": "weekly_ramp_pct",
+        "operator": "gt",
+        "value": 10
+      }
+    ],
+    "actions": [
+      {
+        "type": "reduce_volume",
+        "params": {
+          "target_ramp_pct": 10,
+          "message": "Weekly mileage increase exceeds 10% - reducing to safe ramp rate"
+        }
+      },
+      {
+        "type": "warn",
+        "params": {
+          "message": "Planned weekly mileage increase is too aggressive"
+        }
+      }
+    ]
+  },
+  "tests": [
+    {
+      "name": "Should trigger when ramp > 10%",
+      "fixture": {
+        "weekly_mileage": 44,
+        "weekly_mileage_prev": 40,
+        "weekly_ramp_pct": 10.5
+      },
+      "expected_triggered": true,
+      "expected_actions": ["reduce_volume", "warn"]
+    },
+    {
+      "name": "Should not trigger when ramp <= 10%",
+      "fixture": {
+        "weekly_mileage": 44,
+        "weekly_mileage_prev": 40,
+        "weekly_ramp_pct": 10
+      },
+      "expected_triggered": false
+    },
+    {
+      "name": "Should trigger on aggressive 20% ramp",
+      "fixture": {
+        "weekly_mileage": 48,
+        "weekly_mileage_prev": 40,
+        "weekly_ramp_pct": 20
+      },
+      "expected_triggered": true,
+      "expected_actions": ["reduce_volume", "warn"]
+    },
+    {
+      "name": "Should not trigger on cutback week",
+      "fixture": {
+        "weekly_mileage": 32,
+        "weekly_mileage_prev": 40,
+        "weekly_ramp_pct": -20
+      },
+      "expected_triggered": false
+    }
+  ]
+}

@@ -1,0 +1,118 @@
+{
+  "name": "quality_conversion",
+  "summary": "Converts quality workouts (tempo, intervals) to easy runs when readiness is low. Triggers on poor sleep, low HRV, or elevated RHR.",
+  "rules": {
+    "type": "quality_conversion",
+    "priority": 90,
+    "conditions": [
+      {
+        "field": "planned_workout_type",
+        "operator": "in",
+        "value": ["tempo", "interval", "threshold"]
+      },
+      {
+        "field": "",
+        "operator": "or",
+        "value": [
+          {
+            "field": "sleep_hours",
+            "operator": "lt",
+            "value": 6
+          },
+          {
+            "field": "hrv_delta_pct",
+            "operator": "lt",
+            "value": -15
+          },
+          {
+            "field": "rhr_delta_pct",
+            "operator": "gt",
+            "value": 10
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "type": "convert_workout",
+        "params": {
+          "from": "quality",
+          "to": "easy",
+          "preserve_duration": true
+        }
+      },
+      {
+        "type": "flag_for_review",
+        "params": {
+          "reason": "Quality workout converted due to low readiness"
+        }
+      }
+    ]
+  },
+  "tests": [
+    {
+      "name": "Should convert tempo when sleep < 6hr",
+      "fixture": {
+        "planned_workout_type": "tempo",
+        "sleep_hours": 5.5,
+        "hrv_delta_pct": 0,
+        "rhr_delta_pct": 0
+      },
+      "expected_triggered": true,
+      "expected_actions": ["convert_workout", "flag_for_review"]
+    },
+    {
+      "name": "Should convert interval when HRV down 20%",
+      "fixture": {
+        "planned_workout_type": "interval",
+        "sleep_hours": 7,
+        "hrv_delta_pct": -20,
+        "rhr_delta_pct": 0
+      },
+      "expected_triggered": true,
+      "expected_actions": ["convert_workout", "flag_for_review"]
+    },
+    {
+      "name": "Should convert when RHR elevated 12%",
+      "fixture": {
+        "planned_workout_type": "threshold",
+        "sleep_hours": 7,
+        "hrv_delta_pct": 0,
+        "rhr_delta_pct": 12
+      },
+      "expected_triggered": true,
+      "expected_actions": ["convert_workout", "flag_for_review"]
+    },
+    {
+      "name": "Should not convert easy run",
+      "fixture": {
+        "planned_workout_type": "easy",
+        "sleep_hours": 5,
+        "hrv_delta_pct": -20,
+        "rhr_delta_pct": 15
+      },
+      "expected_triggered": false
+    },
+    {
+      "name": "Should not convert when readiness is good",
+      "fixture": {
+        "planned_workout_type": "tempo",
+        "sleep_hours": 7.5,
+        "hrv_delta_pct": 5,
+        "rhr_delta_pct": -2
+      },
+      "expected_triggered": false
+    },
+    {
+      "name": "Should convert on multiple poor signals",
+      "fixture": {
+        "planned_workout_type": "interval",
+        "sleep_hours": 5,
+        "hrv_delta_pct": -25,
+        "rhr_delta_pct": 15
+      },
+      "expected_triggered": true,
+      "expected_actions": ["convert_workout", "flag_for_review"]
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "name": "travel_recovery",
+  "summary": "Enforces recovery period after travel, especially with timezone changes. Minimum 48hr for timezone changes > 3hr.",
+  "rules": {
+    "type": "travel_recovery",
+    "priority": 85,
+    "conditions": [
+      {
+        "field": "travel_days_ago",
+        "operator": "lte",
+        "value": 2
+      },
+      {
+        "field": "timezone_change_hours",
+        "operator": "gte",
+        "value": 3
+      },
+      {
+        "field": "planned_workout_type",
+        "operator": "in",
+        "value": ["tempo", "interval", "threshold", "long"]
+      }
+    ],
+    "actions": [
+      {
+        "type": "convert_workout",
+        "params": {
+          "from": "quality",
+          "to": "easy",
+          "reduce_duration_pct": 20
+        }
+      },
+      {
+        "type": "warn",
+        "params": {
+          "message": "Within 48hr of travel with significant timezone change - keeping it easy"
+        }
+      }
+    ]
+  },
+  "tests": [
+    {
+      "name": "Should convert tempo 1 day after 5hr timezone change",
+      "fixture": {
+        "travel_days_ago": 1,
+        "timezone_change_hours": 5,
+        "planned_workout_type": "tempo"
+      },
+      "expected_triggered": true,
+      "expected_actions": ["convert_workout", "warn"]
+    },
+    {
+      "name": "Should convert long run day of 3hr timezone change",
+      "fixture": {
+        "travel_days_ago": 0,
+        "timezone_change_hours": 3,
+        "planned_workout_type": "long"
+      },
+      "expected_triggered": true,
+      "expected_actions": ["convert_workout", "warn"]
+    },
+    {
+      "name": "Should not convert easy run after travel",
+      "fixture": {
+        "travel_days_ago": 1,
+        "timezone_change_hours": 5,
+        "planned_workout_type": "easy"
+      },
+      "expected_triggered": false
+    },
+    {
+      "name": "Should not trigger 3+ days after travel",
+      "fixture": {
+        "travel_days_ago": 3,
+        "timezone_change_hours": 5,
+        "planned_workout_type": "tempo"
+      },
+      "expected_triggered": false
+    },
+    {
+      "name": "Should not trigger for small timezone change",
+      "fixture": {
+        "travel_days_ago": 1,
+        "timezone_change_hours": 2,
+        "planned_workout_type": "tempo"
+      },
+      "expected_triggered": false
+    }
+  ]
+}
