@@ -1,0 +1,47 @@
+# RunV2 Athlete Configuration
+# This file defines your preferences, goals, and sensitivities.
+# The coach uses this to personalize recommendations.
+
+# Basic preferences
+units: miles  # miles | km
+timezone: America/Los_Angeles
+max_days_running_per_week: 6
+preferred_long_run_day: sunday
+hr_zones_preference: lactate_threshold  # lactate_threshold | max_hr | heart_rate_reserve
+
+# Privacy mode
+# strict = local transcription only, no external APIs
+# standard = external APIs OK with redaction applied
+# verbose = full logging for debugging
+privacy_mode: standard
+
+# Current training focus
+# Set to null if no active race goal
+current_race_goal: null  # Will reference races.id when set
+
+# Injury sensitivities (body parts to watch carefully)
+injury_sensitivities:
+  - left_calf
+  # - right_achilles
+  # - left_knee
+
+# Shoe rotation (track mileage per shoe)
+shoe_rotation:
+  - name: Nike Vaporfly 3
+    miles: 245
+    max_miles: 300
+    notes: Race day only
+  - name: Nike Pegasus 40
+    miles: 412
+    max_miles: 500
+    notes: Daily trainer
+  # - name: Hoka Speedgoat 5
+  #   miles: 89
+  #   max_miles: 400
+  #   notes: Trail runs
+
+# Coach personality preferences
+coach_style:
+  verbosity: concise  # concise | detailed | verbose
+  tone: analytical    # analytical | motivational | balanced
+  proactivity: moderate  # conservative | moderate | aggressive
