@@ -53,12 +53,20 @@ program
   .command('plan')
   .description('Training plan management')
   .argument('<subcommand>', 'week | generate-block')
-  .action(async (subcommand: string) => {
+  .option('--weeks <n>', 'Number of weeks for block', parseInt)
+  .option('--start <date>', 'Start date (YYYY-MM-DD)')
+  .option('--mileage <n>', 'Target weekly mileage', parseInt)
+  .action(async (subcommand: string, options: { weeks?: number; start?: string; mileage?: number }) => {
     if (subcommand === 'week') {
       const { planWeekCommand } = await import('./plan-week.js');
       await planWeekCommand();
     } else if (subcommand === 'generate-block') {
-      console.log(chalk.yellow('generate-block not yet implemented'));
+      const { planBlockCommand } = await import('./plan-block.js');
+      await planBlockCommand({
+        weeks: options.weeks,
+        startDate: options.start,
+        targetMileage: options.mileage,
+      });
     } else {
       console.error(chalk.red(`Unknown subcommand: ${subcommand}`));
       process.exit(1);
