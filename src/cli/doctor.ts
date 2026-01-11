@@ -6,6 +6,7 @@ import chalk from 'chalk';
 import { isDbInitialized, closeDb } from '../db/client.js';
 import { verifySchema } from '../db/migrate.js';
 import { runAnomalyDetection, getOpenIssues, resolveIssue } from '../integrity/anomaly-detector.js';
+import { checkAllPromptsCompatibility, generateCompatibilityReport } from '../compatibility/prompt-checker.js';
 
 interface DoctorOptions {
   fix?: boolean;
@@ -53,10 +54,64 @@ export async function doctorCommand(options: DoctorOptions): Promise<void> {
   // Compatibility check
   if (options.compat) {
     console.log('');
-    console.log(chalk.blue('Checking compatibility...'));
-    // TODO: Implement schema/prompt compatibility checks
-    console.log(chalk.yellow('  Compatibility checks not yet implemented'));
-    console.log(chalk.gray('  Will verify prompt expectations match schema'));
+    console.log(chalk.blue('Checking prompt ↔ schema compatibility...'));
+
+    try {
+      const results = checkAllPromptsCompatibility();
+      let compatIssues = 0;
+      let compatWarnings = 0;
+
+      for (const [promptName, result] of results) {
+        if (result.compatible) {
+          if (options.verbose) {
+            console.log(chalk.green(`  ✓ ${promptName}`));
+          }
+        } else {
+          console.log(chalk.red(`  ✗ ${promptName}`));
+          compatIssues++;
+
+          for (const issue of result.issues) {
+            console.log(chalk.red(`      ${issue}`));
+          }
+
+          if (result.schema_check.missing_tables.length > 0) {
+            console.log(chalk.red(`      Missing tables: ${result.schema_check.missing_tables.join(', ')}`));
+          }
+
+          if (result.schema_check.missing_columns.length > 0) {
+            const cols = result.schema_check.missing_columns.map(c => `${c.table}.${c.column}`);
+            console.log(chalk.red(`      Missing columns: ${cols.join(', ')}`));
+          }
+        }
+
+        for (const warning of result.warnings) {
+          console.log(chalk.yellow(`      Warning: ${warning}`));
+          compatWarnings++;
+        }
+      }
+
+      if (compatIssues === 0) {
+        console.log(chalk.green(`  All ${results.size} prompts compatible with schema`));
+      } else {
+        console.log(chalk.red(`  ${compatIssues} prompt(s) have compatibility issues`));
+        issuesFound += compatIssues;
+      }
+
+      if (compatWarnings > 0 && !options.verbose) {
+        console.log(chalk.yellow(`  ${compatWarnings} warning(s) - run with --verbose for details`));
+      }
+
+      if (options.verbose) {
+        console.log('');
+        console.log(chalk.gray('Full compatibility report:'));
+        console.log(chalk.gray(generateCompatibilityReport()));
+      }
+    } catch (err) {
+      console.log(chalk.yellow('  Could not run compatibility checks'));
+      if (options.verbose && err instanceof Error) {
+        console.log(chalk.gray(`    ${err.message}`));
+      }
+    }
   }
 
   // Run anomaly detection

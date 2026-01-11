@@ -1,9 +1,14 @@
 /**
  * Rollback command - Revert to a previous state via event sourcing
+ *
+ * Safety rules:
+ * - Rollbacks are additive (create rollback_applied event, not rewrite history)
+ * - Protected tables never rolled back: raw_ingest, events, coach_sessions
+ * - Domain tables can be rolled back: workouts, planned_workouts, decisions, patterns, etc.
  */
 
 import chalk from 'chalk';
-import { isDbInitialized, closeDb, query, queryOne } from '../db/client.js';
+import { isDbInitialized, closeDb, query, queryOne, execute, generateId } from '../db/client.js';
 
 interface Event {
   id: string;
@@ -17,6 +22,40 @@ interface Event {
   source: string;
   reason: string | null;
 }
+
+// Tables that can be rolled back
+const ROLLBACKABLE_TABLES = new Set([
+  'workouts',
+  'planned_workouts',
+  'health_snapshots',
+  'coaching_decisions',
+  'discovered_patterns',
+  'athlete_knowledge',
+  'overrides',
+  'training_plans',
+  'training_blocks',
+  'races',
+  'fitness_tests',
+  'pace_zones',
+  'life_events',
+  'strength_sessions',
+  'injury_status',
+  'policies',
+  'weekly_summaries',
+  'readiness_baselines',
+  'daily_training_load',
+  'data_issues',
+]);
+
+// Tables that are NEVER rolled back (audit trail)
+const PROTECTED_TABLES = new Set([
+  'raw_ingest',
+  'events',
+  'coach_sessions',
+  'schema_versions',
+  'prompt_versions',
+  'sync_state',
+]);
 
 interface RollbackOptions {
   to?: string;
@@ -132,31 +171,201 @@ export async function rollbackCommand(options: RollbackOptions): Promise<void> {
     return;
   }
 
-  // Rollback safety: only domain tables, never raw_ingest/events/coach_sessions
-  const protectedEntityTypes = ['raw_ingest', 'events', 'coach_sessions'];
+  // Filter to only rollbackable events
+  const rollbackableEvents = eventsToRevert.filter(
+    e => ROLLBACKABLE_TABLES.has(e.entity_type)
+  );
+
   const skippedEvents = eventsToRevert.filter(
-    e => protectedEntityTypes.includes(e.entity_type)
+    e => PROTECTED_TABLES.has(e.entity_type)
   );
 
   if (skippedEvents.length > 0) {
-    console.log(chalk.yellow(`Skipping ${skippedEvents.length} protected event(s) (raw_ingest, events, coach_sessions)`));
+    console.log(chalk.yellow(`Skipping ${skippedEvents.length} protected event(s)`));
+    if (options.verbose) {
+      for (const event of skippedEvents) {
+        console.log(chalk.gray(`  - ${event.entity_type}/${event.entity_id}`));
+      }
+    }
   }
 
+  if (rollbackableEvents.length === 0) {
+    console.log(chalk.yellow('No rollbackable events found'));
+    closeDb();
+    return;
+  }
+
+  console.log(chalk.blue(`Rollbackable events: ${rollbackableEvents.length}`));
   console.log('');
-  console.log(chalk.yellow('Rollback not yet fully implemented'));
+
+  // Process rollbacks in reverse chronological order
+  const rollbackResults = {
+    success: 0,
+    failed: 0,
+    skipped: 0,
+  };
+
+  for (const event of rollbackableEvents) {
+    const result = await revertEvent(event, options.verbose);
+    if (result === 'success') {
+      rollbackResults.success++;
+    } else if (result === 'failed') {
+      rollbackResults.failed++;
+    } else {
+      rollbackResults.skipped++;
+    }
+  }
+
+  // Record the rollback as an event itself
+  const rollbackEventId = generateId();
+  execute(
+    `INSERT INTO events (id, timestamp_utc, entity_type, entity_id, action, source, reason, diff_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      rollbackEventId,
+      new Date().toISOString(),
+      'rollback',
+      targetEvent.id,
+      'rollback_applied',
+      'cli_rollback',
+      `Rolled back to event ${targetEvent.id}`,
+      JSON.stringify({
+        target_event_id: targetEvent.id,
+        target_timestamp: targetEvent.timestamp_utc,
+        events_reverted: rollbackableEvents.length,
+        events_skipped: skippedEvents.length,
+        results: rollbackResults,
+      }),
+    ]
+  );
+
   console.log('');
-  console.log('This command will:');
-  console.log('  1. Revert domain tables to their state at the target event');
-  console.log('  2. Create a rollback_applied event (additive, not rewriting history)');
-  console.log('  3. Never touch raw_ingest, events, or coach_sessions');
-  console.log('  4. Preserve the full audit trail');
+  console.log(chalk.bold('Rollback Summary'));
+  console.log('─'.repeat(40));
+  console.log(chalk.green(`  Reverted: ${rollbackResults.success}`));
+  if (rollbackResults.failed > 0) {
+    console.log(chalk.red(`  Failed: ${rollbackResults.failed}`));
+  }
+  if (rollbackResults.skipped > 0) {
+    console.log(chalk.yellow(`  Skipped: ${rollbackResults.skipped}`));
+  }
   console.log('');
-  console.log('Protected tables (never rolled back):');
-  console.log('  - raw_ingest (original data for reprocessing)');
-  console.log('  - events (audit trail)');
-  console.log('  - coach_sessions (decision history)');
+  console.log(chalk.gray(`Rollback event recorded: ${rollbackEventId}`));
 
   closeDb();
+}
+
+/**
+ * Revert a single event
+ */
+async function revertEvent(
+  event: Event,
+  verbose?: boolean
+): Promise<'success' | 'failed' | 'skipped'> {
+  try {
+    const tableName = event.entity_type;
+    const entityId = event.entity_id;
+
+    switch (event.action) {
+      case 'create':
+      case 'insert':
+        // For create events, delete the entity
+        if (verbose) {
+          console.log(chalk.gray(`  Deleting ${tableName}/${entityId}`));
+        }
+        execute(`DELETE FROM ${tableName} WHERE id = ?`, [entityId]);
+        return 'success';
+
+      case 'update':
+        // For update events, restore previous state from diff_json
+        if (!event.diff_json) {
+          if (verbose) {
+            console.log(chalk.yellow(`  No diff data for ${tableName}/${entityId}, skipping`));
+          }
+          return 'skipped';
+        }
+
+        const diff = JSON.parse(event.diff_json);
+
+        // Check if we have before values
+        if (!diff.before) {
+          if (verbose) {
+            console.log(chalk.yellow(`  No before state for ${tableName}/${entityId}, skipping`));
+          }
+          return 'skipped';
+        }
+
+        // Build UPDATE statement from before values
+        const beforeKeys = Object.keys(diff.before);
+        if (beforeKeys.length === 0) {
+          return 'skipped';
+        }
+
+        const setClause = beforeKeys.map(k => `${k} = ?`).join(', ');
+        const values = beforeKeys.map(k => {
+          const val = diff.before[k];
+          return typeof val === 'object' ? JSON.stringify(val) : val;
+        });
+
+        if (verbose) {
+          console.log(chalk.gray(`  Restoring ${tableName}/${entityId} (${beforeKeys.join(', ')})`));
+        }
+
+        execute(
+          `UPDATE ${tableName} SET ${setClause} WHERE id = ?`,
+          [...values, entityId]
+        );
+        return 'success';
+
+      case 'delete':
+        // For delete events, we cannot easily restore without full row data
+        // This would require having stored the full row in diff_json
+        if (!event.diff_json) {
+          if (verbose) {
+            console.log(chalk.yellow(`  Cannot restore deleted ${tableName}/${entityId} - no data`));
+          }
+          return 'skipped';
+        }
+
+        const deletedData = JSON.parse(event.diff_json);
+        if (!deletedData.deleted_row) {
+          if (verbose) {
+            console.log(chalk.yellow(`  Cannot restore deleted ${tableName}/${entityId} - incomplete data`));
+          }
+          return 'skipped';
+        }
+
+        // Reconstruct INSERT statement
+        const row = deletedData.deleted_row;
+        const columns = Object.keys(row);
+        const placeholders = columns.map(() => '?').join(', ');
+        const insertValues = columns.map(k => {
+          const val = row[k];
+          return typeof val === 'object' ? JSON.stringify(val) : val;
+        });
+
+        if (verbose) {
+          console.log(chalk.gray(`  Restoring deleted ${tableName}/${entityId}`));
+        }
+
+        execute(
+          `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`,
+          insertValues
+        );
+        return 'success';
+
+      default:
+        if (verbose) {
+          console.log(chalk.yellow(`  Unknown action "${event.action}" for ${tableName}/${entityId}`));
+        }
+        return 'skipped';
+    }
+  } catch (err) {
+    if (verbose) {
+      console.log(chalk.red(`  Error reverting ${event.entity_type}/${event.entity_id}: ${err}`));
+    }
+    return 'failed';
+  }
 }
 
 export async function listEventsCommand(

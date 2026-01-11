@@ -575,6 +575,16 @@ CREATE TABLE IF NOT EXISTS readiness_baselines (
 );
 
 -- ===========================================
+-- DERIVED: Daily training load
+-- ===========================================
+CREATE TABLE IF NOT EXISTS daily_training_load (
+    local_date TEXT PRIMARY KEY,
+    total_load INTEGER,
+    workout_count INTEGER,
+    computed_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ===========================================
 -- VIEWS: Convenience queries
 -- ===========================================
 
