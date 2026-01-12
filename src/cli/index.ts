@@ -52,12 +52,32 @@ program
 program
   .command('plan')
   .description('Training plan management')
-  .argument('<subcommand>', 'week | generate-block')
+  .argument('<subcommand>', 'create | week | generate-block')
   .option('--weeks <n>', 'Number of weeks for block', parseInt)
   .option('--start <date>', 'Start date (YYYY-MM-DD)')
   .option('--mileage <n>', 'Target weekly mileage', parseInt)
-  .action(async (subcommand: string, options: { weeks?: number; start?: string; mileage?: number }) => {
-    if (subcommand === 'week') {
+  .option('--race <name>', 'Race name (for create)')
+  .option('--date <date>', 'Race date (for create)')
+  .option('--goal <time>', 'Goal time (for create)')
+  .option('--quick', 'Quick mode - use smart defaults (for create)')
+  .action(async (subcommand: string, options: {
+    weeks?: number;
+    start?: string;
+    mileage?: number;
+    race?: string;
+    date?: string;
+    goal?: string;
+    quick?: boolean;
+  }) => {
+    if (subcommand === 'create') {
+      const { planCreateCommand } = await import('./plan-create.js');
+      await planCreateCommand({
+        race: options.race,
+        date: options.date,
+        goal: options.goal,
+        quick: options.quick,
+      });
+    } else if (subcommand === 'week') {
       const { planWeekCommand } = await import('./plan-week.js');
       await planWeekCommand();
     } else if (subcommand === 'generate-block') {

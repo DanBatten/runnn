@@ -129,6 +129,8 @@ export function insertWithEvent<T extends Record<string, unknown>>(
   const placeholders = columns.map(() => '?').join(', ');
   const values = columns.map(col => {
     const val = dataWithId[col];
+    // Handle null explicitly (typeof null === 'object' in JS)
+    if (val === null || val === undefined) return null;
     return typeof val === 'object' ? JSON.stringify(val) : val;
   });
 
