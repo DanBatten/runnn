@@ -59,7 +59,12 @@ program
   .option('--race <name>', 'Race name (for create)')
   .option('--date <date>', 'Race date (for create)')
   .option('--goal <time>', 'Goal time (for create)')
-  .option('--quick', 'Quick mode - use smart defaults (for create)')
+  .option('--distance <dist>', 'Race distance: marathon, half, 10k, 5k (for create)')
+  .option('--days <n>', 'Days per week: 3-6 (for create)', parseInt)
+  .option('--long-run-day <day>', 'Long run day: saturday or sunday (for create)')
+  .option('--approach <type>', 'Training approach: gradual or aggressive (for create)')
+  .option('--analyze', 'Just run analysis, don\'t create plan (for create)')
+  .option('--no-save', 'Generate plan but don\'t save to database (for create)')
   .action(async (subcommand: string, options: {
     weeks?: number;
     start?: string;
@@ -67,7 +72,12 @@ program
     race?: string;
     date?: string;
     goal?: string;
-    quick?: boolean;
+    distance?: string;
+    days?: number;
+    longRunDay?: string;
+    approach?: string;
+    analyze?: boolean;
+    save?: boolean;
   }) => {
     if (subcommand === 'create') {
       const { planCreateCommand } = await import('./plan-create.js');
@@ -75,7 +85,12 @@ program
         race: options.race,
         date: options.date,
         goal: options.goal,
-        quick: options.quick,
+        distance: options.distance,
+        days: options.days,
+        longRunDay: options.longRunDay,
+        approach: options.approach,
+        analyze: options.analyze,
+        save: options.save,
       });
     } else if (subcommand === 'week') {
       const { planWeekCommand } = await import('./plan-week.js');

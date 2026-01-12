@@ -1,31 +1,40 @@
 /**
- * Plan Create - Interactive training plan creation CLI
+ * Plan Create - Non-interactive training plan creation CLI
  *
- * Orchestrates the complete flow:
- * 1. Analyze historical data
- * 2. Interactive goal setting
- * 3. Generate multi-block plan
- * 4. Display and confirm
- * 5. Save to database
+ * Designed to be called by Claude Code with all parameters provided.
+ * Claude handles the conversation, this command handles execution.
+ *
+ * Usage:
+ *   runnn plan create --race "LA Marathon" --date 2026-03-08 --distance marathon --goal 3:30:00
  */
 
 import chalk from 'chalk';
-import enquirer from 'enquirer';
-import { isDbInitialized, closeDb, query, insertWithEvent, generateId } from '../db/client.js';
+import { isDbInitialized, closeDb, query, execute, insertWithEvent, generateId } from '../db/client.js';
 import { analyzeAthlete, formatPace, AthleteAnalysis } from '../coach/athlete-analysis.js';
 import { generatePlan, savePlan, TrainingGoal, TrainingPlan } from '../coach/plan-generator.js';
-// getRaceDayNutrition available for future race-day planning feature
 
-const { Select, Input, Confirm, MultiSelect } = enquirer as any;
+// ===== Types =====
+
+export interface PlanCreateOptions {
+  // Required
+  race?: string;
+  date?: string;
+  distance?: string;
+
+  // Optional with defaults
+  goal?: string;
+  days?: number;
+  longRunDay?: string;
+  approach?: string;
+
+  // Flags
+  analyze?: boolean;  // Just run analysis, don't create plan
+  save?: boolean;     // Auto-save without confirmation (default true)
+}
 
 // ===== Main Command =====
 
-export async function planCreateCommand(options?: {
-  race?: string;
-  date?: string;
-  goal?: string;
-  quick?: boolean;
-}): Promise<void> {
+export async function planCreateCommand(options: PlanCreateOptions = {}): Promise<void> {
   const dbPath = process.env.DATABASE_PATH ?? './data/coach.db';
 
   if (!isDbInitialized(dbPath)) {
@@ -34,59 +43,60 @@ export async function planCreateCommand(options?: {
     return;
   }
 
-  console.log('');
-  console.log(chalk.bold('═'.repeat(68)));
-  console.log(chalk.bold.cyan('                    TRAINING PLAN CREATION'));
-  console.log(chalk.bold('═'.repeat(68)));
-  console.log('');
-
   try {
-    // Phase 1: Analysis
-    console.log(chalk.bold('Phase 1: Analyzing your training history...'));
+    // Always run analysis first
+    console.log('');
+    console.log(chalk.bold('═'.repeat(68)));
+    console.log(chalk.bold.cyan('                    TRAINING PLAN CREATION'));
+    console.log(chalk.bold('═'.repeat(68)));
+    console.log('');
+
+    console.log(chalk.bold('Analyzing your training history...'));
     console.log('');
 
     const analysis = analyzeAthlete();
     displayAnalysis(analysis);
 
-    // Check for blocking concerns
-    const blockingConcerns = analysis.concerns.filter(c =>
-      c.includes('Active injury') || c.includes('No workout history')
-    );
-
-    if (blockingConcerns.length > 0 && !options?.quick) {
-      console.log(chalk.yellow('Concerns detected:'));
-      blockingConcerns.forEach(c => console.log(chalk.yellow(`  ! ${c}`)));
-      console.log('');
-
-      const proceed = new Confirm({
-        name: 'proceed',
-        message: 'Continue with plan creation anyway?',
-        initial: false,
-      });
-
-      const shouldProceed = await proceed.run();
-      if (!shouldProceed) {
-        console.log(chalk.gray('Plan creation cancelled.'));
-        closeDb();
-        return;
-      }
+    // If --analyze flag, stop here
+    if (options.analyze) {
+      console.log(chalk.gray('Analysis complete. Use options to create a plan.'));
+      closeDb();
+      return;
     }
 
-    // Phase 2: Goal Setting
-    console.log('');
-    console.log(chalk.bold('─'.repeat(68)));
-    console.log(chalk.bold('Phase 2: Goal Setting'));
-    console.log('');
+    // Validate required options
+    if (!options.race || !options.date || !options.distance) {
+      console.log(chalk.yellow('Missing required options for plan creation:'));
+      if (!options.race) console.log(chalk.yellow('  --race <name>     Race name'));
+      if (!options.date) console.log(chalk.yellow('  --date <YYYY-MM-DD>  Race date'));
+      if (!options.distance) console.log(chalk.yellow('  --distance <marathon|half|10k|5k>'));
+      console.log('');
+      console.log(chalk.gray('Example: runnn plan create --race "LA Marathon" --date 2026-03-08 --distance marathon'));
+      closeDb();
+      return;
+    }
 
-    const goal = await gatherGoals(analysis, options);
+    // Validate distance
+    const validDistances = ['marathon', 'half', '10k', '5k'];
+    if (!validDistances.includes(options.distance)) {
+      console.log(chalk.red(`Invalid distance: ${options.distance}`));
+      console.log(chalk.gray(`Valid options: ${validDistances.join(', ')}`));
+      closeDb();
+      return;
+    }
 
-    // Validate race date
-    const raceDate = new Date(goal.race.date);
+    // Validate date
+    const raceDate = new Date(options.date);
     const today = new Date();
-    const weeksUntilRace = Math.ceil((raceDate.getTime() - today.getTime()) / (7 * 24 * 60 * 60 * 1000));
+    if (isNaN(raceDate.getTime())) {
+      console.log(chalk.red('Invalid date format. Use YYYY-MM-DD'));
+      closeDb();
+      return;
+    }
 
+    const weeksUntilRace = Math.ceil((raceDate.getTime() - today.getTime()) / (7 * 24 * 60 * 60 * 1000));
     if (weeksUntilRace < 1) {
-      console.log(chalk.red('Error: Race date must be in the future'));
+      console.log(chalk.red('Race date must be in the future'));
       closeDb();
       return;
     }
@@ -95,44 +105,28 @@ export async function planCreateCommand(options?: {
       console.log(chalk.yellow(`Note: Only ${weeksUntilRace} weeks until race - generating abbreviated plan`));
     }
 
-    // Check for existing active plan
+    // Build goal from options
+    const goal = buildGoalFromOptions(options, analysis);
+
+    // Check for existing active plan and archive it
     const existingPlan = query<{ id: string; name: string }>(
       "SELECT id, name FROM training_plans WHERE status = 'active' LIMIT 1"
     );
 
-    if (existingPlan.length > 0 && !options?.quick) {
-      console.log('');
-      console.log(chalk.yellow(`You have an active plan: "${existingPlan[0].name}"`));
-
-      const archive = new Confirm({
-        name: 'archive',
-        message: 'Archive it and create a new plan?',
-        initial: true,
-      });
-
-      const shouldArchive = await archive.run();
-      if (shouldArchive) {
-        insertWithEvent('training_plans', {
-          id: existingPlan[0].id,
-          status: 'archived',
-        }, { source: 'plan_create' });
-        console.log(chalk.gray('Previous plan archived.'));
-      } else {
-        console.log(chalk.gray('Plan creation cancelled.'));
-        closeDb();
-        return;
-      }
+    if (existingPlan.length > 0) {
+      console.log(chalk.gray(`Archiving previous plan: "${existingPlan[0].name}"`));
+      execute('UPDATE training_plans SET status = ? WHERE id = ?', ['archived', existingPlan[0].id]);
     }
 
-    // Phase 3: Generation
+    // Generate plan
     console.log('');
     console.log(chalk.bold('─'.repeat(68)));
-    console.log(chalk.bold('Phase 3: Generating Your Plan...'));
+    console.log(chalk.bold('Generating Your Plan...'));
     console.log('');
 
     const plan = generatePlan(analysis, goal);
 
-    // Phase 4: Display
+    // Display plan
     console.log('');
     console.log(chalk.bold('═'.repeat(68)));
     console.log(chalk.bold.green('                      YOUR TRAINING PLAN'));
@@ -141,49 +135,82 @@ export async function planCreateCommand(options?: {
 
     displayPlan(plan);
 
-    // Phase 5: Confirmation
-    console.log('');
-
-    if (options?.quick) {
-      // Auto-save in quick mode
+    // Save plan (default behavior)
+    if (options.save !== false) {
       savePlan(plan);
+      saveAthleteKnowledge(goal);
       console.log(chalk.green('✓ Plan saved!'));
+      console.log('');
+      console.log('  Next steps:');
+      console.log(`  • View this week: ${chalk.cyan('runnn plan week')}`);
+      console.log(`  • Morning check: ${chalk.cyan('runnn morning')}`);
+      console.log(`  • After runs: ${chalk.cyan('runnn postrun')}`);
     } else {
-      const savePrompt = new Select({
-        name: 'action',
-        message: 'Save this plan?',
-        choices: [
-          { name: 'yes', message: 'Yes, save it' },
-          { name: 'no', message: 'Cancel' },
-        ],
-      });
-
-      const action = await savePrompt.run();
-
-      if (action === 'yes') {
-        savePlan(plan);
-        saveAthleteKnowledge(goal);
-        console.log('');
-        console.log(chalk.green('✓ Plan saved!'));
-        console.log('');
-        console.log('  Next steps:');
-        console.log(`  • View this week: ${chalk.cyan('runnn plan week')}`);
-        console.log(`  • Morning check: ${chalk.cyan('runnn morning')}`);
-        console.log(`  • After runs: ${chalk.cyan('runnn postrun')}`);
-      } else {
-        console.log(chalk.gray('Plan creation cancelled.'));
-      }
+      console.log(chalk.gray('Plan generated but not saved (--no-save flag)'));
     }
+
   } catch (error: any) {
-    if (error.message?.includes('cancelled')) {
-      console.log(chalk.gray('\nPlan creation cancelled.'));
-    } else {
-      console.error(chalk.red('Error creating plan:'), error.message);
-    }
+    console.error(chalk.red('Error creating plan:'), error.message);
   }
 
   console.log('');
   closeDb();
+}
+
+// ===== Build Goal from Options =====
+
+function buildGoalFromOptions(options: PlanCreateOptions, _analysis: AthleteAnalysis): TrainingGoal {
+  const distanceMeters: Record<string, number> = {
+    marathon: 42195,
+    half: 21097.5,
+    '10k': 10000,
+    '5k': 5000,
+  };
+
+  const distance = options.distance as 'marathon' | 'half' | '10k' | '5k';
+
+  // Parse goal time if provided
+  let goalTimeSeconds: number | null = null;
+  if (options.goal) {
+    goalTimeSeconds = parseTime(options.goal);
+  }
+
+  // Validate days per week
+  let daysPerWeek = options.days || 5;
+  if (daysPerWeek < 3) daysPerWeek = 3;
+  if (daysPerWeek > 6) daysPerWeek = 6;
+
+  // Validate long run day
+  let longRunDay: 'saturday' | 'sunday' = 'sunday';
+  if (options.longRunDay === 'saturday') {
+    longRunDay = 'saturday';
+  }
+
+  // Validate approach
+  const gradualBuild = options.approach !== 'aggressive';
+
+  return {
+    race: {
+      name: options.race!,
+      distance,
+      distance_meters: distanceMeters[distance],
+      date: options.date!,
+      goal_time_seconds: goalTimeSeconds,
+      priority: 'A',
+    },
+    constraints: {
+      max_days_per_week: daysPerWeek,
+      preferred_long_run_day: longRunDay,
+      max_weekly_mileage: null,
+      blocked_days: [],
+      strength_days: [],
+      injury_considerations: [],
+    },
+    preferences: {
+      gradual_build: gradualBuild,
+      quality_focus: 'balanced',
+    },
+  };
 }
 
 // ===== Display Functions =====
@@ -254,7 +281,7 @@ function displayAnalysis(analysis: AthleteAnalysis): void {
   if (analysis.concerns.length > 0) {
     console.log(chalk.cyan('  Concerns:'));
     analysis.concerns.forEach(c => {
-      console.log(chalk.yellow(`  ! ${c}`));
+      console.log(chalk.yellow(`  • ${c}`));
     });
     console.log('');
   }
@@ -335,271 +362,6 @@ function displayMileageChart(plan: TrainingPlan): void {
   console.log('');
 }
 
-// ===== Interactive Goal Setting =====
-
-async function gatherGoals(
-  analysis: AthleteAnalysis,
-  options?: { race?: string; date?: string; goal?: string; quick?: boolean }
-): Promise<TrainingGoal> {
-  const distanceMeters: Record<string, number> = {
-    marathon: 42195,
-    half: 21097.5,
-    '10k': 10000,
-    '5k': 5000,
-  };
-
-  // Quick mode: use provided options with smart defaults
-  if (options?.quick && options.race && options.date) {
-    // Infer distance from race name
-    let distance: 'marathon' | 'half' | '10k' | '5k' = 'half';
-    const nameLower = options.race.toLowerCase();
-    if (nameLower.includes('marathon') && !nameLower.includes('half')) {
-      distance = 'marathon';
-    } else if (nameLower.includes('half')) {
-      distance = 'half';
-    } else if (nameLower.includes('10k')) {
-      distance = '10k';
-    } else if (nameLower.includes('5k')) {
-      distance = '5k';
-    }
-
-    // Parse goal time if provided
-    let goalTimeSeconds: number | null = null;
-    if (options.goal) {
-      goalTimeSeconds = parseTime(options.goal);
-    }
-
-    console.log(chalk.gray(`  Quick mode: ${distance} on ${options.date}`));
-    console.log('');
-
-    return {
-      race: {
-        name: options.race,
-        distance,
-        distance_meters: distanceMeters[distance],
-        date: options.date,
-        goal_time_seconds: goalTimeSeconds,
-        priority: 'A',
-      },
-      constraints: {
-        max_days_per_week: 5,
-        preferred_long_run_day: 'sunday',
-        max_weekly_mileage: null,
-        blocked_days: [],
-        strength_days: [],
-        injury_considerations: [],
-      },
-      preferences: {
-        gradual_build: true,
-        quality_focus: 'balanced',
-      },
-    };
-  }
-
-  // Interactive mode: prompt for each setting
-  // Race distance
-  const distancePrompt = new Select({
-    name: 'distance',
-    message: 'What race distance are you training for?',
-    choices: [
-      { name: 'marathon', message: 'Marathon (26.2 mi)' },
-      { name: 'half', message: 'Half Marathon (13.1 mi)' },
-      { name: '10k', message: '10K (6.2 mi)' },
-      { name: '5k', message: '5K (3.1 mi)' },
-    ],
-  });
-
-  const distance = await distancePrompt.run() as 'marathon' | 'half' | '10k' | '5k';
-
-  // Race name
-  const namePrompt = new Input({
-    name: 'name',
-    message: 'Race name?',
-    initial: options?.race || '',
-  });
-
-  const raceName = await namePrompt.run();
-
-  // Race date
-  const datePrompt = new Input({
-    name: 'date',
-    message: 'Race date? (YYYY-MM-DD)',
-    initial: options?.date || '',
-    validate: (value: string) => {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-        return 'Please enter date as YYYY-MM-DD';
-      }
-      const date = new Date(value);
-      if (isNaN(date.getTime())) {
-        return 'Invalid date';
-      }
-      if (date <= new Date()) {
-        return 'Race date must be in the future';
-      }
-      return true;
-    },
-  });
-
-  const raceDate = await datePrompt.run();
-
-  // Goal time
-  const goalTypePrompt = new Select({
-    name: 'goalType',
-    message: 'What is your goal?',
-    choices: [
-      { name: 'pr', message: 'PR attempt (push for best time)' },
-      { name: 'specific', message: 'Specific finish time' },
-      { name: 'finish', message: 'Just finish comfortably' },
-    ],
-  });
-
-  const goalType = await goalTypePrompt.run();
-
-  let goalTimeSeconds: number | null = null;
-
-  if (goalType === 'specific') {
-    const timePrompt = new Input({
-      name: 'time',
-      message: 'Goal time? (H:MM:SS or MM:SS)',
-      initial: options?.goal || '',
-      validate: (value: string) => {
-        const parts = value.split(':').map(Number);
-        if (parts.some(isNaN) || parts.length < 2 || parts.length > 3) {
-          return 'Enter time as H:MM:SS or MM:SS';
-        }
-        return true;
-      },
-    });
-
-    const timeStr = await timePrompt.run();
-    goalTimeSeconds = parseTime(timeStr);
-  } else if (goalType === 'pr' && analysis.inferred_capabilities.estimated_half_pace) {
-    // Estimate a reasonable goal based on current fitness
-    const estPace = distance === 'marathon'
-      ? analysis.inferred_capabilities.estimated_marathon_pace
-      : distance === 'half'
-        ? analysis.inferred_capabilities.estimated_half_pace
-        : distance === '10k'
-          ? analysis.inferred_capabilities.estimated_10k_pace
-          : analysis.inferred_capabilities.estimated_5k_pace;
-
-    if (estPace) {
-      goalTimeSeconds = Math.round((distanceMeters[distance] / 1609.344) * estPace);
-    }
-  }
-
-  // Days per week
-  const daysPrompt = new Select({
-    name: 'days',
-    message: 'How many days per week can you run?',
-    choices: [
-      { name: '4', message: '4 days (good recovery)' },
-      { name: '5', message: '5 days (solid base)' },
-      { name: '6', message: '6 days (experienced runner)' },
-    ],
-  });
-
-  const daysPerWeek = parseInt(await daysPrompt.run());
-
-  // Long run day
-  const longRunPrompt = new Select({
-    name: 'longRun',
-    message: 'Preferred day for long runs?',
-    choices: [
-      { name: 'sunday', message: 'Sunday' },
-      { name: 'saturday', message: 'Saturday' },
-    ],
-  });
-
-  const longRunDay = await longRunPrompt.run() as 'saturday' | 'sunday';
-
-  // Build preference
-  const buildPrompt = new Select({
-    name: 'build',
-    message: 'Training approach preference?',
-    choices: [
-      { name: 'gradual', message: 'Gradual (conservative, prioritize consistency)' },
-      { name: 'aggressive', message: 'Aggressive (faster progression, higher risk)' },
-    ],
-  });
-
-  const buildPref = await buildPrompt.run();
-
-  // Constraints
-  let blockedDays: string[] = [];
-  let strengthDays: string[] = [];
-
-  const hasConstraints = new Confirm({
-    name: 'constraints',
-    message: 'Do you have schedule constraints or strength training days to consider?',
-    initial: false,
-  });
-
-  if (await hasConstraints.run()) {
-    const blockedPrompt = new MultiSelect({
-      name: 'blocked',
-      message: 'Any days you CANNOT run? (space to select)',
-      choices: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
-    });
-
-    blockedDays = (await blockedPrompt.run() as string[]).map(d => d.toLowerCase());
-
-    const strengthPrompt = new MultiSelect({
-      name: 'strength',
-      message: 'Which days do you do strength training?',
-      choices: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
-    });
-
-    strengthDays = (await strengthPrompt.run() as string[]).map(d => d.toLowerCase());
-  }
-
-  // Injury considerations
-  let injuryConsiderations: string[] = [];
-
-  if (analysis.health_profile.injury_history.length > 0) {
-    const recentInjuries = analysis.health_profile.injury_history
-      .filter(i => i.severity >= 3)
-      .map(i => i.location);
-
-    if (recentInjuries.length > 0) {
-      console.log(chalk.yellow(`\n  Note: Recent injury history: ${recentInjuries.join(', ')}`));
-
-      const considerInjury = new Confirm({
-        name: 'injury',
-        message: 'Should we be conservative with these areas?',
-        initial: true,
-      });
-
-      if (await considerInjury.run()) {
-        injuryConsiderations = recentInjuries;
-      }
-    }
-  }
-
-  return {
-    race: {
-      name: raceName,
-      distance,
-      distance_meters: distanceMeters[distance],
-      date: raceDate,
-      goal_time_seconds: goalTimeSeconds,
-      priority: 'A',
-    },
-    constraints: {
-      max_days_per_week: daysPerWeek,
-      preferred_long_run_day: longRunDay,
-      max_weekly_mileage: null,
-      blocked_days: blockedDays,
-      strength_days: strengthDays,
-      injury_considerations: injuryConsiderations,
-    },
-    preferences: {
-      gradual_build: buildPref === 'gradual',
-      quality_focus: 'balanced',
-    },
-  };
-}
-
 // ===== Knowledge Persistence =====
 
 function saveAthleteKnowledge(goal: TrainingGoal): void {
@@ -625,7 +387,7 @@ function saveAthleteKnowledge(goal: TrainingGoal): void {
     );
 
     if (existing.length > 0) {
-      query(
+      execute(
         'UPDATE athlete_knowledge SET value = ?, last_confirmed_at = datetime("now") WHERE key = ?',
         [entry.value, entry.key]
       );
