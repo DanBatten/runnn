@@ -12,6 +12,7 @@ import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { insertWithEvent, queryOne, getDb } from '../db/client.js';
 import { emitEvent } from '../db/events.js';
+import { getLastNDays, getTimezone } from '../util/timezone.js';
 
 interface SyncState {
   source: string;
@@ -128,26 +129,48 @@ function hashPayload(payload: unknown): string {
 
 /**
  * Check if we've already ingested this data
+ * Checks both raw_ingest table AND workouts table (for merged records)
  */
 function isAlreadyIngested(sourceId: string, payloadHash: string): boolean {
-  const existing = queryOne<{ id: string }>(
+  // Check raw_ingest table
+  const existingIngest = queryOne<{ id: string }>(
     `SELECT id FROM raw_ingest
      WHERE source = 'garmin' AND (source_id = ? OR payload_hash = ?)`,
     [sourceId, payloadHash]
   );
-  return existing !== null;
+  if (existingIngest !== undefined && existingIngest !== null) {
+    return true;
+  }
+
+  // Also check workouts table for garmin_id (handles merged LifeOS records)
+  const existingWorkout = queryOne<{ id: string }>(
+    `SELECT id FROM workouts WHERE garmin_id = ?`,
+    [sourceId]
+  );
+  return existingWorkout !== undefined && existingWorkout !== null;
 }
 
 /**
- * Store raw ingest record
+ * Store raw ingest record (returns existing ID if duplicate)
  */
 function storeRawIngest(
   sourceId: string,
   payload: unknown
-): string {
-  const id = nanoid();
+): string | null {
   const payloadJson = JSON.stringify(payload);
   const payloadHash = hashPayload(payload);
+
+  // Check if we already have this exact data
+  const existing = queryOne<{ id: string }>(
+    `SELECT id FROM raw_ingest WHERE source = 'garmin' AND payload_hash = ?`,
+    [payloadHash]
+  );
+
+  if (existing) {
+    return existing.id;
+  }
+
+  const id = nanoid();
 
   insertWithEvent(
     'raw_ingest',
@@ -168,18 +191,17 @@ function storeRawIngest(
 
 /**
  * Parse Garmin activity and store as workout
+ * Note: Caller must verify this activity hasn't been ingested already
  */
 function processActivity(
   activity: GarminActivity,
-  rawIngestId: string
+  rawIngestId: string | null
 ): string | null {
-  const sourceId = String(activity.activityId);
-  const payloadHash = hashPayload(activity);
-
-  // Check for duplicate
-  if (isAlreadyIngested(sourceId, payloadHash)) {
+  if (!rawIngestId) {
     return null;
   }
+
+  const sourceId = String(activity.activityId);
 
   // Parse times
   const startTimeUtc = activity.startTimeGMT;
@@ -323,26 +345,220 @@ function processHealthData(
       });
     }
   } else {
-    // Insert new record
-    insertWithEvent(
-      'health_snapshots',
-      data,
-      { source: 'garmin_sync', entityId: date }
-    );
+    // Insert new record (health_snapshots uses local_date as PK, not id)
+    const db = getDb();
+    const columns = Object.keys(data);
+    const placeholders = columns.map(() => '?').join(', ');
+    const values = columns.map(col => {
+      const val = data[col];
+      if (val === null || val === undefined) return null;
+      return typeof val === 'object' ? JSON.stringify(val) : val;
+    });
+
+    db.prepare(
+      `INSERT INTO health_snapshots (${columns.join(', ')}) VALUES (${placeholders})`
+    ).run(...values);
+
+    emitEvent({
+      entityType: 'health_snapshots',
+      entityId: date,
+      action: 'create',
+      source: 'garmin_sync',
+    });
   }
 
   return true;
 }
 
+interface OAuth2Token {
+  access_token: string;
+  refresh_token: string;
+  expires_at: number;
+  refresh_token_expires_at: number;
+}
+
 /**
- * Main sync function - syncs activities and health data
- *
- * Note: This is a stub implementation. The actual Garmin API calls
- * would be made via:
- * 1. Python subprocess using garminconnect library
- * 2. Or a separate MCP server
- *
- * The data structure here matches the expected Garmin API response format.
+ * Parse OAuth2 token from environment
+ */
+function getOAuth2Token(): OAuth2Token | null {
+  const tokenStr = process.env.GARMIN_OAUTH2_TOKEN;
+  if (!tokenStr) return null;
+
+  try {
+    return JSON.parse(tokenStr);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refresh the OAuth2 token using the refresh token
+ * Returns the new token or null if refresh failed
+ */
+async function refreshOAuth2Token(currentToken: OAuth2Token): Promise<OAuth2Token | null> {
+  try {
+    console.log('  Token expired, attempting refresh...');
+
+    // Garmin's token refresh endpoint
+    const response = await fetch('https://di-cert.garmin.com/di-oauth/exchange/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'GarminConnect/4.0',
+      },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: currentToken.refresh_token,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(`  Token refresh failed: ${response.status} - ${text}`);
+      return null;
+    }
+
+    const newToken = await response.json() as OAuth2Token;
+
+    // Calculate expires_at if not provided
+    if (!newToken.expires_at && (newToken as any).expires_in) {
+      newToken.expires_at = Math.floor(Date.now() / 1000) + (newToken as any).expires_in;
+    }
+
+    console.log('  ✓ Token refreshed successfully');
+
+    // Note: In production, you'd want to save this back to .env
+    // For now, we'll just use it for this session
+    return newToken;
+  } catch (error) {
+    console.error('  Token refresh error:', error);
+    return null;
+  }
+}
+
+/**
+ * Make authenticated request to Garmin Connect API
+ */
+async function garminRequest<T>(
+  endpoint: string,
+  accessToken: string
+): Promise<T> {
+  const response = await fetch(`https://connect.garmin.com${endpoint}`, {
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'DI-Backend': 'connectapi.garmin.com',
+      'User-Agent': 'GarminConnect/4.0',
+      'Accept': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Garmin API error ${response.status}: ${text}`);
+  }
+
+  return response.json() as Promise<T>;
+}
+
+/**
+ * Fetch activities from Garmin Connect API
+ */
+async function fetchActivities(
+  accessToken: string,
+  limit: number = 50,
+  start: number = 0
+): Promise<GarminActivity[]> {
+  // Use activitylist-service for fetching activities
+  const activities = await garminRequest<GarminActivity[]>(
+    `/activitylist-service/activities/search/activities?limit=${limit}&start=${start}`,
+    accessToken
+  );
+  return activities;
+}
+
+/**
+ * Fetch HRV data for a specific date
+ */
+async function fetchHRV(accessToken: string, date: string): Promise<GarminHRV | null> {
+  try {
+    const data = await garminRequest<{ hrvSummary?: { lastNightAvg?: number; status?: string } }>(
+      `/hrv-service/hrv/${date}`,
+      accessToken
+    );
+    if (data.hrvSummary?.lastNightAvg) {
+      return {
+        calendarDate: date,
+        hrvValue: data.hrvSummary.lastNightAvg,
+        status: data.hrvSummary.status || 'UNKNOWN',
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch sleep data for a specific date
+ */
+async function fetchSleep(accessToken: string, date: string): Promise<GarminSleep | null> {
+  try {
+    const data = await garminRequest<{
+      dailySleepDTO?: {
+        sleepTimeSeconds?: number;
+        sleepScores?: { overall?: { value: number } };
+      };
+    }>(
+      `/wellness-service/wellness/dailySleepData/${date}`,
+      accessToken
+    );
+    if (data.dailySleepDTO?.sleepTimeSeconds) {
+      return {
+        calendarDate: date,
+        sleepTimeSeconds: data.dailySleepDTO.sleepTimeSeconds,
+        sleepScores: {
+          overall: { value: data.dailySleepDTO.sleepScores?.overall?.value || 0 },
+        },
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch daily stats (RHR, body battery, stress)
+ */
+async function fetchDailyStats(accessToken: string, date: string): Promise<GarminDailyStats | null> {
+  try {
+    const data = await garminRequest<{
+      restingHeartRate?: number;
+      maxHeartRate?: number;
+      bodyBatteryChargedValue?: number;
+      averageStressLevel?: number;
+    }>(
+      `/usersummary-service/usersummary/daily/${date}`,
+      accessToken
+    );
+    return {
+      calendarDate: date,
+      totalKilocalories: 0,
+      activeKilocalories: 0,
+      restingHeartRate: data.restingHeartRate || 0,
+      maxHeartRate: data.maxHeartRate || 0,
+      sleepingSeconds: 0,
+      averageStressLevel: data.averageStressLevel || 0,
+      bodyBatteryChargedValue: data.bodyBatteryChargedValue || 0,
+      bodyBatteryDrainedValue: 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Main sync function - syncs activities and health data from Garmin Connect
  */
 export async function syncGarmin(options: {
   force?: boolean;
@@ -360,51 +576,109 @@ export async function syncGarmin(options: {
   const lastCursor = options.force ? null : (syncState?.cursor ?? null);
 
   try {
-    // In a real implementation, this would call the Garmin API
-    // For now, we demonstrate the flow with placeholder logic
+    console.log('  Connecting to Garmin Connect...');
 
-    console.log('  Connecting to Garmin...');
-
-    // Check for required credentials
-    const username = process.env.GARMIN_USERNAME;
-    const password = process.env.GARMIN_PASSWORD;
-
-    if (!username || !password) {
-      result.errors.push('GARMIN_USERNAME and GARMIN_PASSWORD must be set in .env');
-      updateSyncState(lastCursor, 'Missing credentials');
+    // Get OAuth2 token
+    let oauth2 = getOAuth2Token();
+    if (!oauth2) {
+      result.errors.push('GARMIN_OAUTH2_TOKEN must be set in .env');
+      updateSyncState(lastCursor, 'Missing OAuth2 token');
       return result;
     }
 
-    // This is where we'd make the actual API calls
-    // For demonstration, showing the structure:
-    /*
-    const client = new GarminConnect({ username, password });
-    await client.login();
+    // Check if token is expired and try to refresh
+    const now = Math.floor(Date.now() / 1000);
+    if (oauth2.expires_at < now) {
+      // Check if refresh token is also expired
+      if (oauth2.refresh_token_expires_at && oauth2.refresh_token_expires_at < now) {
+        result.errors.push('Both access and refresh tokens expired. Please re-authenticate with Garmin.');
+        updateSyncState(lastCursor, 'Tokens expired');
+        return result;
+      }
 
-    // Fetch activities since last sync
-    const activities = await client.getActivities(0, 50);
+      // Try to refresh the token
+      const newToken = await refreshOAuth2Token(oauth2);
+      if (!newToken) {
+        result.errors.push('Failed to refresh OAuth2 token. Please re-authenticate with Garmin.');
+        updateSyncState(lastCursor, 'Token refresh failed');
+        return result;
+      }
+      oauth2 = newToken;
+    }
 
-    // Fetch health data
-    const today = new Date().toISOString().slice(0, 10);
-    const hrv = await client.getHRVData(today);
-    const sleep = await client.getSleepData(today);
-    const dailyStats = await client.getDailyStats(today);
-    */
+    const accessToken = oauth2.access_token;
 
-    // Placeholder: Show that sync would happen
-    console.log('  Garmin sync requires Python connector');
-    console.log('  See mcp-servers/runnn/garmin_connector.py');
+    // Fetch activities
+    console.log('  Fetching activities...');
+    const activities = await fetchActivities(accessToken, 50);
+    console.log(`  Found ${activities.length} activities`);
+
+    // Filter to running activities only
+    const runningActivities = activities.filter(a => {
+      const typeKey = a.activityType?.typeKey || '';
+      return typeKey.includes('running') || typeKey === 'run';
+    });
+
+    console.log(`  ${runningActivities.length} running activities`);
+
+    // Process each running activity
+    for (const activity of runningActivities) {
+      const sourceId = String(activity.activityId);
+      const payloadHash = hashPayload(activity);
+
+      // Skip if already ingested
+      if (isAlreadyIngested(sourceId, payloadHash)) {
+        continue;
+      }
+
+      console.log(`  + ${activity.activityName} (${(activity.distance / 1609.34).toFixed(1)} mi)`);
+
+      // Store raw ingest
+      const rawIngestId = storeRawIngest(sourceId, activity);
+
+      // Process into workout
+      const workoutId = processActivity(activity, rawIngestId);
+      if (workoutId) {
+        result.newActivityIds.push(workoutId);
+        result.activitiesSynced++;
+      }
+    }
+
+
+    // Fetch health data for last N days
+    const daysBack = options.daysBack ?? 7;
+    const tzInfo = getTimezone();
+    console.log(`  Fetching health data (last ${daysBack} days, timezone: ${tzInfo.timezone})...`);
+
+    // Get dates in athlete's local timezone (auto-detected from system)
+    const datesToFetch = getLastNDays(daysBack);
+
+    for (const dateStr of datesToFetch) {
+
+      const hrv = await fetchHRV(accessToken, dateStr);
+      const sleep = await fetchSleep(accessToken, dateStr);
+      const dailyStats = await fetchDailyStats(accessToken, dateStr);
+
+      if (hrv || sleep || dailyStats) {
+        const rawData = { date: dateStr, hrv, sleep, dailyStats };
+        const rawIngestId = storeRawIngest(`health_${dateStr}`, rawData);
+        processHealthData(dateStr, hrv, sleep, dailyStats, rawIngestId);
+        result.healthSnapshotsSynced++;
+      }
+    }
 
     // Update cursor to now
     const newCursor = new Date().toISOString();
     updateSyncState(newCursor);
 
     result.success = true;
+    console.log(`  ✓ Synced ${result.activitiesSynced} activities, ${result.healthSnapshotsSynced} health snapshots`);
 
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     result.errors.push(errorMsg);
     updateSyncState(lastCursor, errorMsg);
+    console.error(`  Error: ${errorMsg}`);
   }
 
   return result;

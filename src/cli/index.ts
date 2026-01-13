@@ -42,6 +42,14 @@ program
   });
 
 program
+  .command('today')
+  .description('Show today\'s workout with full prescription and health metrics')
+  .action(async () => {
+    const { todayCommand } = await import('./today.js');
+    await todayCommand();
+  });
+
+program
   .command('postrun')
   .description('Process latest run and pending notes')
   .action(async () => {
@@ -208,6 +216,16 @@ program
   .action(async (path: string, options) => {
     const { importLifeOSCommand } = await import('../connectors/lifeos-import.js');
     await importLifeOSCommand(path, options);
+  });
+
+program
+  .command('timezone')
+  .description('View or set timezone (auto-detects from system by default)')
+  .option('--set <timezone>', 'Override timezone (e.g., America/Los_Angeles)')
+  .option('--clear', 'Clear override and use system timezone')
+  .action(async (options) => {
+    const { timezoneCommand } = await import('./timezone.js');
+    await timezoneCommand(options);
   });
 
 program
