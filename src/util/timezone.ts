@@ -23,8 +23,8 @@ interface TimezoneInfo {
  * Get the current timezone, auto-detecting from system when possible
  */
 export function getTimezone(): TimezoneInfo {
-  let timezone: string;
-  let source: TimezoneInfo['source'];
+  let timezone: string | undefined;
+  let source: TimezoneInfo['source'] = 'default'; // Initialize to satisfy TypeScript
 
   // 1. Check for database override (useful for testing or edge cases)
   try {

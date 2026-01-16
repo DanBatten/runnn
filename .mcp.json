@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "runnn-coach": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./mcp-servers/runv2/dist/index.js"
+      ],
+      "env": {}
+    }
+  }
+}

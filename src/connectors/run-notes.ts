@@ -83,7 +83,7 @@ export function scanInbox(): string[] {
   }
 
   const files = readdirSync(NOTES_INBOX_PATH)
-    .filter(f => f.endsWith('.json'))
+    .filter(f => f.endsWith('.json') || f.endsWith('.txt'))
     .map(f => join(NOTES_INBOX_PATH, f));
 
   return files;

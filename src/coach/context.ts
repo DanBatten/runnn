@@ -13,6 +13,7 @@ import { query, queryOne } from '../db/client.js';
 import { getRelevantKnowledge, formatKnowledge } from './knowledge.js';
 import { getLessonsLearned } from './decisions.js';
 import { getActivePolicies } from '../policy/loader.js';
+import { getLocalDate } from '../util/timezone.js';
 import type { PolicyContext } from '../policy/types.js';
 
 /**
@@ -158,7 +159,7 @@ export interface CoachContext {
  * Load full context for a given date
  */
 export function loadContext(date?: string): CoachContext {
-  const today = date ?? new Date().toISOString().split('T')[0];
+  const today = date ?? getLocalDate();
   const dayOfWeek = new Date(today).toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
 
   // Load health snapshot

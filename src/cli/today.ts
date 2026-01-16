@@ -28,10 +28,8 @@ interface HealthSnapshot {
   stress_level: number | null;
 }
 
-interface AthleteKnowledge {
-  key: string;
-  value: string;
-}
+// AthleteKnowledge interface - reserved for future use
+// interface AthleteKnowledge { key: string; value: string; }
 
 function formatPace(minutes: number): string {
   const mins = Math.floor(minutes);

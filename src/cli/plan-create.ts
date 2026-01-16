@@ -388,7 +388,7 @@ function saveAthleteKnowledge(goal: TrainingGoal): void {
 
     if (existing.length > 0) {
       execute(
-        'UPDATE athlete_knowledge SET value = ?, last_confirmed_at = datetime("now") WHERE key = ?',
+        "UPDATE athlete_knowledge SET value = ?, last_confirmed_at = datetime('now') WHERE key = ?",
         [entry.value, entry.key]
       );
     } else {

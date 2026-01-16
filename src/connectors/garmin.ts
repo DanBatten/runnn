@@ -251,6 +251,7 @@ function processActivity(
       training_effect: activity.aerobicTrainingEffect || null,
       device: activity.deviceId ? String(activity.deviceId) : null,
       source: 'garmin',
+      execution_status: 'completed', // Garmin data is always from actual runs
     },
     { source: 'garmin_sync' }
   );
@@ -391,50 +392,14 @@ function getOAuth2Token(): OAuth2Token | null {
   }
 }
 
-/**
- * Refresh the OAuth2 token using the refresh token
- * Returns the new token or null if refresh failed
- */
+// Note: Token refresh is handled by Python script (scripts/garmin-auth.py)
+// The following function is kept for reference but not used:
+/*
 async function refreshOAuth2Token(currentToken: OAuth2Token): Promise<OAuth2Token | null> {
-  try {
-    console.log('  Token expired, attempting refresh...');
-
-    // Garmin's token refresh endpoint
-    const response = await fetch('https://di-cert.garmin.com/di-oauth/exchange/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'GarminConnect/4.0',
-      },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: currentToken.refresh_token,
-      }),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      console.error(`  Token refresh failed: ${response.status} - ${text}`);
-      return null;
-    }
-
-    const newToken = await response.json() as OAuth2Token;
-
-    // Calculate expires_at if not provided
-    if (!newToken.expires_at && (newToken as any).expires_in) {
-      newToken.expires_at = Math.floor(Date.now() / 1000) + (newToken as any).expires_in;
-    }
-
-    console.log('  ✓ Token refreshed successfully');
-
-    // Note: In production, you'd want to save this back to .env
-    // For now, we'll just use it for this session
-    return newToken;
-  } catch (error) {
-    console.error('  Token refresh error:', error);
-    return null;
-  }
+  // Garmin's token refresh endpoint at di-cert.garmin.com doesn't work reliably
+  // Use scripts/garmin-auth.py instead
 }
+*/
 
 /**
  * Make authenticated request to Garmin Connect API
@@ -586,24 +551,28 @@ export async function syncGarmin(options: {
       return result;
     }
 
-    // Check if token is expired and try to refresh
+    // Check if token is expired and needs refresh
     const now = Math.floor(Date.now() / 1000);
-    if (oauth2.expires_at < now) {
-      // Check if refresh token is also expired
-      if (oauth2.refresh_token_expires_at && oauth2.refresh_token_expires_at < now) {
-        result.errors.push('Both access and refresh tokens expired. Please re-authenticate with Garmin.');
-        updateSyncState(lastCursor, 'Tokens expired');
+    if (oauth2.expires_at && oauth2.expires_at < now) {
+      console.log('  Token expired, refreshing via Python script...');
+      const { execSync } = await import('child_process');
+      try {
+        execSync('python3 scripts/garmin-auth.py', {
+          cwd: process.cwd(),
+          stdio: 'pipe',
+          timeout: 30000
+        });
+        // Re-read the token after refresh
+        oauth2 = getOAuth2Token();
+        if (!oauth2) {
+          result.errors.push('Failed to refresh token');
+          return result;
+        }
+        console.log('  ✓ Token refreshed');
+      } catch (e) {
+        result.errors.push('Token refresh failed - please run: python3 scripts/garmin-auth.py');
         return result;
       }
-
-      // Try to refresh the token
-      const newToken = await refreshOAuth2Token(oauth2);
-      if (!newToken) {
-        result.errors.push('Failed to refresh OAuth2 token. Please re-authenticate with Garmin.');
-        updateSyncState(lastCursor, 'Token refresh failed');
-        return result;
-      }
-      oauth2 = newToken;
     }
 
     const accessToken = oauth2.access_token;
@@ -662,8 +631,10 @@ export async function syncGarmin(options: {
       if (hrv || sleep || dailyStats) {
         const rawData = { date: dateStr, hrv, sleep, dailyStats };
         const rawIngestId = storeRawIngest(`health_${dateStr}`, rawData);
-        processHealthData(dateStr, hrv, sleep, dailyStats, rawIngestId);
-        result.healthSnapshotsSynced++;
+        if (rawIngestId) {
+          processHealthData(dateStr, hrv, sleep, dailyStats, rawIngestId);
+          result.healthSnapshotsSynced++;
+        }
       }
     }
 
@@ -726,5 +697,8 @@ export function importHealthData(
   const rawData = { date, hrv, sleep, dailyStats };
   const rawIngestId = storeRawIngest(`health_${date}`, rawData);
 
+  if (!rawIngestId) {
+    return false;
+  }
   return processHealthData(date, hrv, sleep, dailyStats, rawIngestId);
 }
